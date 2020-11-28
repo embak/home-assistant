@@ -17,6 +17,7 @@ from homeassistant.components.cover import (
     PLATFORM_SCHEMA,
     STATE_CLOSED,
     STATE_CLOSING,
+    STATE_OPEN,
     STATE_OPENING,
     SUPPORT_CLOSE,
     SUPPORT_CLOSE_TILT,
@@ -61,15 +62,16 @@ CONF_TILT_COMMAND_STOP = "tilt_command_stop"
 CONF_TILT_OPENING_TIME = "tilt_opening_time"
 CONF_TILT_CLOSING_TIME = "tilt_closing_time"
 
-COVER_DEBUG = True
+COVER_DEBUG = False
 TRAVEL_TIME_MAX = 300
 POSITION_MIN = 0
 POSITION_MAX = 100
+POSITION_UNKNOWN = POSITION_MIN
 
 # Cover status
 COVER_CLOSED = 1
 COVER_CLOSING = 2
-COVER_OPENED = 3
+COVER_OPEN = 3
 COVER_OPENING = 4
 
 TRAVEL_TIME = vol.All(vol.Coerce(float), vol.Range(min=0, max=TRAVEL_TIME_MAX))
@@ -286,23 +288,6 @@ class BroadlinkCover(CoverEntity, RestoreEntity):
             "sw_version": self._device.fw_version,
         }
 
-    def _restore_state(self, state):
-        """Return the state of the cover."""
-        self._is_opening = False
-        self._is_closing = False
-        self._is_closed = False
-
-        if state == STATE_OPENING:
-            self._is_opening = True
-            return
-
-        if state == STATE_CLOSING:
-            self._is_closing = True
-            return
-
-        if state == STATE_CLOSED:
-            self._is_closed = True
-
     @callback
     def update_data(self):
         """Update data."""
@@ -311,18 +296,25 @@ class BroadlinkCover(CoverEntity, RestoreEntity):
     async def async_added_to_hass(self):
         """Call when the cover is added to hass."""
         saved_state = await self.async_get_last_state()
+
         if saved_state:
-            self._restore_state(saved_state.state)
+            if self._supported_features & (SUPPORT_OPEN | SUPPORT_CLOSE | SUPPORT_STOP):
+                sta = saved_state.state
+                if self._supported_features & SUPPORT_SET_POSITION:
+                    pos = saved_state.attributes.get(ATTR_CURRENT_POSITION)
+                else:
+                    pos = None
+                self._main.restore(sta, pos)
 
-            if self.current_cover_position is None:
-                self._main.restore_position(
-                    saved_state.attributes.get(ATTR_CURRENT_POSITION)
-                )
-
-            if self.current_cover_tilt_position is None:
-                self._tilt.restore_position(
-                    saved_state.attributes.get(ATTR_CURRENT_TILT_POSITION)
-                )
+            if self._supported_features & (
+                SUPPORT_OPEN_TILT | SUPPORT_CLOSE_TILT | SUPPORT_STOP_TILT
+            ):
+                if self._supported_features & SUPPORT_SET_TILT_POSITION:
+                    pos = saved_state.attributes.get(ATTR_CURRENT_TILT_POSITION)
+                else:
+                    pos = None
+                sta = STATE_CLOSED if pos == 0 else STATE_OPEN
+                self._tilt.restore(sta, pos)
 
         self.async_on_remove(self._coordinator.async_add_listener(self.update_data))
 
@@ -453,7 +445,7 @@ class _subCover:
     @property
     def current_cover_position(self):
         """Return the current position of the cover."""
-        return self._position
+        return self._position if self._position is not None else POSITION_UNKNOWN
 
     @property
     def is_closed(self):
@@ -472,23 +464,23 @@ class _subCover:
 
     async def async_close_cover(self, **kwargs):
         """Close the cover on command."""
-        _LOGGER.debug("%s is closing", self._name)
+        _LOGGER.debug("Closing %s", self._name)
 
         if await self._async_send_packet(self._command_close):
             self._status = COVER_CLOSING
             self._position_set = POSITION_MIN
             self._listeners_start()
-            self._parent.async_write_ha_state()
+            self._parent.update_data()
 
     async def async_open_cover(self, **kwargs):
         """Open the cover on command."""
-        _LOGGER.debug("%s is opening", self._name)
+        _LOGGER.debug("Opening %s", self._name)
 
         if await self._async_send_packet(self._command_open):
             self._status = COVER_OPENING
             self._position_set = POSITION_MAX
             self._listeners_start()
-            self._parent.async_write_ha_state()
+            self._parent.update_data()
 
     async def async_stop_cover(self, **kwargs):
         """Stop the cover on command."""
@@ -497,13 +489,13 @@ class _subCover:
                 self._update_position(utcnow())
 
             self._status = (
-                COVER_CLOSED if self._position == POSITION_MIN else COVER_OPENED
+                COVER_CLOSED if self._position == POSITION_MIN else COVER_OPEN
             )
             self._position_set = self._position
             self._position_start = None
 
-            self._parent.async_write_ha_state()
-            _LOGGER.debug("%s stopped at position ", self._name, self._position)
+            self._parent.update_data()
+            _LOGGER.debug("%s stopped at position %s", self._name, self._position)
 
     async def async_set_cover_position(self, **kwargs):
         """Move the cover to a specific position."""
@@ -515,15 +507,15 @@ class _subCover:
         position = max(POSITION_MIN, min(round(position, 0), POSITION_MAX))
 
         if position == POSITION_MIN:
-            return self.async_close_cover()
+            return await self.async_close_cover()
 
         if position == POSITION_MAX:
-            return self.async_open_cover()
+            return await self.async_open_cover()
 
         if self._position in [None, position]:
-            return self._parent.async_write_ha_state()
+            return self._parent.update_data()
 
-        _LOGGER.debug("%s setting position to: %i", self._name, position)
+        _LOGGER.debug("Set %s position to: %i", self._name, position)
 
         self._position_set = position
         if self._position_set < self._position:
@@ -535,11 +527,22 @@ class _subCover:
 
         if await self._async_send_packet(command):
             self._listeners_start()
-            self._parent.async_write_ha_state()
+            self._parent.update_data()
 
-    def restore_position(self, position):
-        """Restore cover position."""
-        self.position = position
+    def restore(self, state, position):
+        """Return the state of the cover."""
+        if state in [STATE_CLOSED, STATE_CLOSING]:
+            self._status = COVER_CLOSED
+            self._position = POSITION_MIN
+            return
+
+        if state == STATE_OPENING:
+            self._status = COVER_OPEN
+            self._position = POSITION_MAX
+            return
+
+        self._status = COVER_OPEN
+        self._position = POSITION_MIN if position is None else position
 
     def _listeners_start(self):
         """Start timer listeners."""
@@ -628,14 +631,14 @@ class _subCover:
 
         self._position_start = None
 
-        self._status = COVER_CLOSED if self._position == POSITION_MIN else COVER_OPENED
+        self._status = COVER_CLOSED if self._position == POSITION_MIN else COVER_OPEN
 
-        self._parent.async_write_ha_state()
+        self._parent.update_data()
 
     async def _async_track_cover_position(self, now):
         """Track cover position over time."""
         self._update_position(now)
-        self._parent.async_write_ha_state()
+        self._parent.update_data()
 
     def _update_position(self, now):
         """Compute actual position based on travelling time."""
@@ -646,7 +649,6 @@ class _subCover:
         travel_pos = round(travel_time.total_seconds() * self._speed)
         position = self._position_start + travel_pos
         self._position = max(POSITION_MIN, min(position, POSITION_MAX))
-        self._closed = self._position <= POSITION_MIN
 
         _LOGGER.debug("%s position is: %i ", self._name, self._position)
 
